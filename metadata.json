@@ -1,0 +1,5 @@
+{
+  "name": "YouTube Transcriber",
+  "description": "Transcreva vídeos e playlists do YouTube para texto usando IA.",
+  "requestFramePermissions": []
+}
