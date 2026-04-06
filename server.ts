@@ -4,6 +4,7 @@ import path from "path";
 import fs from "fs";
 import { Readable } from "stream";
 import { pipeline as streamPipeline } from "stream/promises";
+import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import cors from "cors";
 import { v4 as uuidv4 } from "uuid";
@@ -11,7 +12,7 @@ import { mkdirp } from "mkdirp";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegStatic from "ffmpeg-static";
 import { pipeline as transformersPipeline } from "@xenova/transformers";
-import { Innertube, UniversalCache } from "youtubei.js";
+import wavefile from "wavefile";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -21,7 +22,7 @@ if (ffmpegStatic) {
 }
 
 const TEMP_DIR = path.join(__dirname, "temp");
-const YT_CACHE_DIR = path.join(TEMP_DIR, "youtubei-cache");
+const TOOLS_DIR = path.join(TEMP_DIR, "tools");
 const MAX_COLLECTION_SIZE = 50;
 const YOUTUBE_BASE_URL = "https://www.youtube.com";
 const YOUTUBE_HOSTS = new Set([
@@ -34,13 +35,49 @@ const YOUTUBE_HOSTS = new Set([
 const PLAYLIST_ID_RE = /^(PL|UU|LL|RD|UL|OLAK5uy_|FL|WL)[A-Za-z0-9_-]+$/;
 const CHANNEL_ID_RE = /^UC[A-Za-z0-9_-]+$/;
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+const YT_DLP_FILENAME = process.platform === "win32" ? "yt-dlp.exe" : "yt-dlp";
+const YT_DLP_PATH = path.join(TOOLS_DIR, YT_DLP_FILENAME);
+const YT_DLP_DOWNLOAD_URL =
+  process.platform === "win32"
+    ? "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+    : "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp";
 
 mkdirp.sync(TEMP_DIR);
-mkdirp.sync(YT_CACHE_DIR);
+mkdirp.sync(TOOLS_DIR);
 
-const jobs: Record<string, { status: string; progress: number; result?: string; error?: string; title?: string }> = {};
+type Job = {
+  status: string;
+  progress: number;
+  result?: string;
+  error?: string;
+  title?: string;
+};
 
-// Cache for transcribers by model name
+type VideoEntry = {
+  id?: string;
+  url?: string;
+  webpage_url?: string;
+  original_url?: string;
+  title?: string;
+  thumbnail?: string;
+  thumbnails?: Array<{ url?: string }>;
+};
+
+type YtDlpResponse = {
+  id?: string;
+  title?: string;
+  uploader?: string;
+  channel?: string;
+  thumbnail?: string;
+  thumbnails?: Array<{ url?: string }>;
+  webpage_url?: string;
+  original_url?: string;
+  entries?: VideoEntry[];
+};
+
+const jobs: Record<string, Job> = {};
+const { WaveFile } = wavefile;
+
 const transcribers: Record<string, any> = {};
 async function getTranscriber(modelName: string) {
   const fullModelName = `Xenova/whisper-${modelName}`;
@@ -51,22 +88,39 @@ async function getTranscriber(modelName: string) {
   return transcribers[fullModelName];
 }
 
-let youtubeClientPromise: Promise<Innertube> | null = null;
-async function getYoutubeClient() {
-  if (!youtubeClientPromise) {
-    youtubeClientPromise = Innertube.create({
-      retrieve_player: true,
-      generate_session_locally: true,
-      fail_fast: false,
-      enable_session_cache: true,
-      cache: new UniversalCache(true, YT_CACHE_DIR),
-    }).catch((error) => {
-      youtubeClientPromise = null;
+let ytDlpSetupPromise: Promise<string> | null = null;
+async function ensureYtDlp() {
+  if (fs.existsSync(YT_DLP_PATH)) {
+    return YT_DLP_PATH;
+  }
+
+  if (!ytDlpSetupPromise) {
+    ytDlpSetupPromise = (async () => {
+      const tempPath = `${YT_DLP_PATH}.download`;
+      const response = await fetch(YT_DLP_DOWNLOAD_URL);
+
+      if (!response.ok || !response.body) {
+        throw new Error(`Failed to download yt-dlp: ${response.status} ${response.statusText}`);
+      }
+
+      await streamPipeline(
+        Readable.fromWeb(response.body as any),
+        fs.createWriteStream(tempPath)
+      );
+
+      if (process.platform !== "win32") {
+        fs.chmodSync(tempPath, 0o755);
+      }
+
+      fs.renameSync(tempPath, YT_DLP_PATH);
+      return YT_DLP_PATH;
+    })().catch((error) => {
+      ytDlpSetupPromise = null;
       throw error;
     });
   }
 
-  return youtubeClientPromise;
+  return ytDlpSetupPromise;
 }
 
 function normalizeYouTubeInput(input: string) {
@@ -90,73 +144,6 @@ function parseYouTubeUrl(input: string) {
   } catch {
     return null;
   }
-}
-
-function toAbsoluteYouTubeUrl(url: string) {
-  return new URL(url, YOUTUBE_BASE_URL).toString();
-}
-
-function textValue(value: { toString?: () => string } | string | null | undefined) {
-  if (!value) return "";
-  if (typeof value === "string") return value;
-  return value.toString?.() ?? String(value);
-}
-
-function buildWatchUrl(videoId: string) {
-  return `${YOUTUBE_BASE_URL}/watch?v=${videoId}`;
-}
-
-function pickThumbnail(thumbnails?: Array<{ url?: string }>, videoId?: string) {
-  return thumbnails?.[0]?.url ?? (videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : "");
-}
-
-function getVideoItemId(item: any) {
-  return item?.video_id ?? item?.id;
-}
-
-function mapVideoItem(item: any) {
-  const id = getVideoItemId(item);
-  if (!id) return null;
-
-  const endpointUrl = item?.endpoint?.metadata?.url;
-  return {
-    id,
-    title: textValue(item?.title) || `Video ${id}`,
-    thumbnail: pickThumbnail(item?.thumbnails, id),
-    url: endpointUrl ? toAbsoluteYouTubeUrl(endpointUrl) : buildWatchUrl(id),
-  };
-}
-
-async function collectPaginatedItems<T>(
-  initialPage: any,
-  getItems: (page: any) => T[],
-  limit = MAX_COLLECTION_SIZE
-) {
-  const collected: T[] = [];
-  const seen = new Set<string>();
-  let currentPage = initialPage;
-
-  while (currentPage) {
-    for (const item of getItems(currentPage)) {
-      const id = getVideoItemId(item);
-      if (!id || seen.has(id)) continue;
-
-      seen.add(id);
-      collected.push(item);
-
-      if (collected.length >= limit) {
-        return collected;
-      }
-    }
-
-    if (!currentPage.has_continuation || typeof currentPage.getContinuation !== "function") {
-      break;
-    }
-
-    currentPage = await currentPage.getContinuation();
-  }
-
-  return collected;
 }
 
 function extractPlaylistId(input: string) {
@@ -212,125 +199,169 @@ function isChannelInput(input: string) {
   );
 }
 
-function getChannelFallbackQuery(input: string) {
-  const trimmed = input.trim();
-  if (trimmed.startsWith("@")) {
-    return trimmed;
-  }
-
-  const parsed = parseYouTubeUrl(input);
-  if (!parsed) {
-    return CHANNEL_ID_RE.test(trimmed) ? trimmed : null;
-  }
-
-  const segments = parsed.pathname.split("/").filter(Boolean);
-  if (segments.length === 0) return null;
-
-  return segments[0].startsWith("@") ? segments[0] : segments[segments.length - 1];
+function buildWatchUrl(videoId: string) {
+  return `${YOUTUBE_BASE_URL}/watch?v=${videoId}`;
 }
 
-async function resolveChannelId(input: string) {
-  const normalized = normalizeYouTubeInput(input);
-  if (CHANNEL_ID_RE.test(normalized)) {
-    return normalized;
-  }
+function pickThumbnail(
+  value?: { thumbnail?: string; thumbnails?: Array<{ url?: string }> },
+  fallbackVideoId?: string
+) {
+  return (
+    value?.thumbnail ??
+    value?.thumbnails?.find((thumbnail) => thumbnail?.url)?.url ??
+    (fallbackVideoId ? `https://i.ytimg.com/vi/${fallbackVideoId}/hqdefault.jpg` : "")
+  );
+}
 
-  const parsed = parseYouTubeUrl(normalized);
-  const directId = parsed?.pathname.match(/^\/channel\/([^/?]+)/i)?.[1];
-  if (directId) {
-    return directId;
-  }
+function toVideoRecord(entry: VideoEntry) {
+  const id = entry.id ?? extractVideoId(entry.url ?? entry.webpage_url ?? entry.original_url ?? "");
+  if (!id) return null;
 
-  const yt = await getYoutubeClient();
+  const url =
+    entry.webpage_url ??
+    entry.original_url ??
+    (entry.url?.startsWith("http") ? entry.url : buildWatchUrl(id));
 
-  if (parsed) {
-    try {
-      const endpoint = await yt.resolveURL(parsed.toString());
-      const browseId = endpoint.payload?.browseId ?? endpoint.payload?.browse_id;
+  return {
+    id,
+    title: entry.title ?? `Video ${id}`,
+    thumbnail: pickThumbnail(entry, id),
+    url,
+  };
+}
 
-      if (typeof browseId === "string" && CHANNEL_ID_RE.test(browseId)) {
-        return browseId;
+async function runYtDlp(args: string[]) {
+  const binaryPath = await ensureYtDlp();
+
+  return await new Promise<string>((resolve, reject) => {
+    const child = spawn(binaryPath, args, {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    child.on("error", reject);
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout.trim());
+        return;
       }
-    } catch (error) {
-      console.warn("Channel resolve fallback triggered:", error);
-    }
-  }
 
-  const fallbackQuery = getChannelFallbackQuery(input);
-  if (!fallbackQuery) {
-    return null;
-  }
-
-  const search = await yt.search(fallbackQuery, { type: "channel" });
-  const firstChannel = search.channels[0];
-
-  return firstChannel?.id ?? null;
+      reject(new Error((stderr || stdout || `yt-dlp exited with code ${code}`).trim()));
+    });
+  });
 }
 
-async function getPlaylistVideos(playlistId: string) {
-  const yt = await getYoutubeClient();
-  const playlist = await yt.getPlaylist(playlistId);
-  const items = await collectPaginatedItems(playlist, (page) => Array.from(page.items ?? []));
+async function runYtDlpJson(input: string, options?: { flatPlaylist?: boolean; noPlaylist?: boolean }) {
+  const args = ["--dump-single-json", "--no-warnings", "--skip-download"];
+
+  if (options?.flatPlaylist) {
+    args.push("--flat-playlist", "--playlist-end", String(MAX_COLLECTION_SIZE));
+  }
+
+  if (options?.noPlaylist) {
+    args.push("--no-playlist");
+  }
+
+  args.push(normalizeYouTubeInput(input));
+
+  return JSON.parse(await runYtDlp(args)) as YtDlpResponse;
+}
+
+async function getCollectionInfo(input: string, type: "playlist" | "channel") {
+  const data = await runYtDlpJson(input, { flatPlaylist: true });
+  const videos = (data.entries ?? []).map(toVideoRecord).filter(Boolean);
 
   return {
-    title: playlist.info.title ?? "Playlist",
-    videos: items.map(mapVideoItem).filter(Boolean),
+    type,
+    title: data.title ?? data.uploader ?? data.channel ?? (type === "channel" ? "Channel" : "Playlist"),
+    videos,
   };
 }
 
-async function getChannelVideos(input: string) {
-  const channelId = await resolveChannelId(input);
-  if (!channelId) {
-    throw new Error("Could not resolve the YouTube channel.");
-  }
+async function getSingleVideoInfo(input: string) {
+  const data = await runYtDlpJson(input, { noPlaylist: true });
+  const videoId = data.id ?? extractVideoId(input);
 
-  const yt = await getYoutubeClient();
-  const channel = await yt.getChannel(channelId);
-  const videoFeed = channel.has_videos ? await channel.getVideos() : channel;
-  const items = await collectPaginatedItems(videoFeed, (page) => Array.from(page.videos ?? []));
-
-  return {
-    title: channel.metadata.title ?? "Channel",
-    videos: items.map(mapVideoItem).filter(Boolean),
-  };
-}
-
-const AUDIO_DOWNLOAD_STRATEGIES = [
-  { client: "ANDROID" as const, type: "audio" as const, quality: "best", format: "any" },
-  { client: "IOS" as const, type: "audio" as const, quality: "best", format: "any" },
-];
-
-async function downloadAudioToFile(input: string, outputPath: string) {
-  const videoId = extractVideoId(input);
   if (!videoId) {
-    throw new Error("Invalid YouTube video URL.");
+    throw new Error("Could not resolve the YouTube video.");
   }
 
-  const yt = await getYoutubeClient();
-  let lastError: unknown;
+  return {
+    type: "video" as const,
+    videos: [
+      {
+        id: videoId,
+        title: data.title ?? `Video ${videoId}`,
+        thumbnail: pickThumbnail(data, videoId),
+        url: data.webpage_url ?? data.original_url ?? buildWatchUrl(videoId),
+      },
+    ],
+  };
+}
 
-  for (const strategy of AUDIO_DOWNLOAD_STRATEGIES) {
-    try {
-      const audioStream = await yt.download(videoId, strategy);
-      await streamPipeline(
-        Readable.fromWeb(audioStream as any),
-        fs.createWriteStream(outputPath)
-      );
-      return;
-    } catch (error) {
-      lastError = error;
-      if (fs.existsSync(outputPath)) {
-        fs.unlinkSync(outputPath);
-      }
+async function downloadAudioToFile(input: string, templateBasePath: string) {
+  const template = `${templateBasePath}.%(ext)s`;
+  const directory = path.dirname(templateBasePath);
+  const basename = path.basename(templateBasePath);
+
+  for (const file of fs.readdirSync(directory)) {
+    if (file.startsWith(`${basename}.`)) {
+      fs.unlinkSync(path.join(directory, file));
     }
   }
 
-  throw lastError instanceof Error ? lastError : new Error("Unable to download audio from YouTube.");
+  await runYtDlp([
+    "--no-warnings",
+    "--no-playlist",
+    "--no-part",
+    "--force-overwrites",
+    "-f",
+    "bestaudio/best",
+    "-o",
+    template,
+    normalizeYouTubeInput(input),
+  ]);
+
+  const outputFile = fs.readdirSync(directory).find((file) => file.startsWith(`${basename}.`));
+  if (!outputFile) {
+    throw new Error("yt-dlp did not produce an audio file.");
+  }
+
+  return path.join(directory, outputFile);
 }
 
 function sanitizeFilename(name: string) {
   const cleaned = name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
   return cleaned || "transcription";
+}
+
+function loadWavSamples(filePath: string) {
+  const wav = new WaveFile(fs.readFileSync(filePath));
+  wav.toBitDepth("32f");
+
+  const samples = wav.getSamples(true, Float32Array);
+  if (samples instanceof Float32Array) {
+    return samples;
+  }
+
+  if (Array.isArray(samples) && samples[0] instanceof Float32Array) {
+    return samples[0];
+  }
+
+  return Float32Array.from(samples as ArrayLike<number>);
 }
 
 async function startServer() {
@@ -340,7 +371,6 @@ async function startServer() {
   app.use(cors());
   app.use(express.json());
 
-  // API Routes
   app.post("/api/video-info", async (req, res) => {
     const input = typeof req.body?.url === "string" ? req.body.url.trim() : "";
 
@@ -349,49 +379,23 @@ async function startServer() {
     }
 
     try {
-      const yt = await getYoutubeClient();
-      const playlistId = extractPlaylistId(input);
-
-      if (playlistId) {
-        const playlist = await getPlaylistVideos(playlistId);
-        return res.json({
-          type: "playlist",
-          title: playlist.title,
-          videos: playlist.videos,
-        });
+      if (extractPlaylistId(input)) {
+        return res.json(await getCollectionInfo(input, "playlist"));
       }
 
       if (isChannelInput(input)) {
-        const channel = await getChannelVideos(input);
-        return res.json({
-          type: "channel",
-          title: channel.title,
-          videos: channel.videos,
-        });
+        return res.json(await getCollectionInfo(input, "channel"));
       }
 
       const videoId = extractVideoId(input);
       if (videoId) {
-        const info = await yt.getBasicInfo(videoId);
-        const canonicalUrl = info.basic_info.url_canonical
-          ? toAbsoluteYouTubeUrl(info.basic_info.url_canonical)
-          : buildWatchUrl(videoId);
-
-        return res.json({
-          type: "video",
-          videos: [{
-            id: info.basic_info.id ?? videoId,
-            title: info.basic_info.title ?? `Video ${videoId}`,
-            thumbnail: pickThumbnail(info.basic_info.thumbnail, videoId),
-            url: canonicalUrl,
-          }],
-        });
+        return res.json(await getSingleVideoInfo(input));
       }
 
-      res.status(400).json({ error: "Invalid YouTube video, playlist or channel URL." });
+      return res.status(400).json({ error: "Invalid YouTube video, playlist or channel URL." });
     } catch (error: any) {
       console.error("Video info error:", error);
-      res.status(500).json({ error: error.message });
+      return res.status(500).json({ error: error.message });
     }
   });
 
@@ -402,20 +406,18 @@ async function startServer() {
 
     res.json({ jobId });
 
-    // Background process
     (async () => {
-      const rawAudioPath = path.join(TEMP_DIR, `${jobId}_raw.audio`);
+      const rawAudioTemplate = path.join(TEMP_DIR, `${jobId}_raw`);
+      let rawAudioPath: string | null = null;
       const wavAudioPath = path.join(TEMP_DIR, `${jobId}.wav`);
 
       try {
-        // Download audio
-        await downloadAudioToFile(url, rawAudioPath);
+        rawAudioPath = await downloadAudioToFile(url, rawAudioTemplate);
 
         jobs[jobId].status = "converting";
 
-        // Convert to 16kHz mono WAV for Whisper
         await new Promise<void>((resolve, reject) => {
-          ffmpeg(rawAudioPath)
+          ffmpeg(rawAudioPath!)
             .toFormat("wav")
             .audioChannels(1)
             .audioFrequency(16000)
@@ -425,13 +427,12 @@ async function startServer() {
         });
 
         jobs[jobId].status = "transcribing";
-        
-        // Transcribe with local Whisper
+
         const pipe = await getTranscriber(model);
-        const output = await pipe(wavAudioPath, {
+        const output = await pipe(loadWavSamples(wavAudioPath), {
           chunk_length_s: 30,
           stride_length_s: 5,
-          language: language,
+          language,
           task: "transcribe",
         });
 
@@ -442,7 +443,7 @@ async function startServer() {
         jobs[jobId].status = "failed";
         jobs[jobId].error = error.message;
       } finally {
-        if (fs.existsSync(rawAudioPath)) fs.unlinkSync(rawAudioPath);
+        if (rawAudioPath && fs.existsSync(rawAudioPath)) fs.unlinkSync(rawAudioPath);
         if (fs.existsSync(wavAudioPath)) fs.unlinkSync(wavAudioPath);
       }
     })();
@@ -463,7 +464,6 @@ async function startServer() {
     res.send(job.result);
   });
 
-  // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -473,7 +473,7 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
